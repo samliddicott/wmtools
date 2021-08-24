@@ -1,0 +1,191 @@
+#! /bin/bash
+
+PS4='+$LINENO:'
+
+# from xprop -root read lines line:
+#  _GTK_WORKAREAS_D2(CARDINAL) = 0, 27, 5120, 1413, 5120, 0, 1920, 1200
+#  _GTK_WORKAREAS_D1(CARDINAL) = 0, 27, 5120, 1413, 5120, 0, 1920, 1200
+#  _GTK_WORKAREAS_D0(CARDINAL) = 0, 27, 5120, 1413, 5120, 0, 1920, 1200
+# _NET_CURRENT_DESKTOP(CARDINAL) = 0
+#
+# where the 1 and 2 (*_D1 and *_D2) match against the value of _NET_CURRENT_DESKTOP
+
+# with 1 line output using \r for continuations
+-xprop() {
+  command xprop "$@" | sed -ne '/^\t/{H;x;s/\n/\r/;${p;d;};x;d};x;1!p;$!d;x;p'
+  return ${PIPESTATUS[0]}
+}
+
+xprop-to-bash() {
+  # create bash assignments that can be eval'd
+  local prefix="${1:-xprop_}"
+  sed -ne '/^\t/!{h;s/([^)]*).*//;s/^/'"$prefix"'/;x};s/^[^=#]*[=#] //;s/\(.\)/\\\1/g;s/^/=/;/^=\\\t/s/^/+/;G;s/^\([^\n]*\)\n\(.*\)/\2\1/;p'
+}
+
+declare -A xprop
+xprop-to-bash-hash() {
+  # create bash array assignments that can be eval'd
+  local hash="${1:-xprop}"
+  sed -ne '/^\t/!{h;s/([^)]*).*/]/;s/^/'"$hash"'[/;x};s/^[^=#]*[=#] //;s/\(.\)/\\\1/g;s/^/=/;/^=\\\t/s/^/+/;G;s/^\([^\n]*\)\n\(.*\)/\2\1/;p'
+}
+
+get-pos-size() {
+  LANG=C xwininfo -id "$1" | sed -ne 's/: *//;s/^  Absolute upper-left [XY]//p;s/  Width//p;s/  Height//p' | tr '\n' ' '
+  test "${PIPESTATUS[*]}" = "0 0 0"
+}
+
+compute-cinnamon-areas() {
+  while read -r x y w h _
+  do areas+=" $x,$y,$w,$h"
+  done < <(
+    for panel in $( xdotool search --onlyvisible --class "nemo-desktop" )
+    do # sort by x position
+       get-pos-size "$panel"
+       echo
+    done | sort -n
+  )
+  declare -p areas >&2
+}
+
+compute-mate-areas() {
+  subtract-panel-areas "mate-panel"
+}
+
+# The stratey here is to take each monitor size as an area, and then enumerate the panels to subract them from the area
+# panels are assumed to be touching or close to an edge and never be near the centre of the screen.
+# A panel whose x1 is in the right half of the screen must be a right panel
+# Otherwise, if the y1 is in the bottom half of the screen, then it must be a bottom panel
+# Otherwise if the y2 is in the right half of the screen then it is a top panel
+# Otherwise if the y2 is in the bottom half of the screen then it is a left panel
+# Otherwise ignore it
+# We don't care if we don't process the panel in order, and we know that all panels are outside the area, so if the panel 
+# overlaps with the area then shrink the area so that it doesn't overlap
+subtract-panel-areas() {
+  local panel_class="$1"
+  local panels panels areas desktops
+  local px py pw ph
+
+  for panel in $( xdotool search --onlyvisible --class "$panel_class" )
+  do panels+=("$(get-pos-size $panel)")
+  done
+
+  desktops=$(xrandr | sed -e '/\*/!d;s/^ *//;s/ .*//' | tr '\n' ' ')
+  # assume all xrandr active outputs in order
+  x=0
+  y=0
+  while test -n "$desktops" && IFS="x$IFS" read -r w h desktops <<<"$desktops"
+  do # subtract panels from this monitor area
+     let x1=x y1=y x2=x+w y2=y+h
+
+     for panel in "${panels[@]}"
+     do read -r px py pw ph <<<"$panel"
+        # see if in top bottom left or right
+        if test "$px" -ge "$x" -a "$px" -le "$(( x + w))" -a "$py" -ge "$y" -a "$py" -le "$(( y + h ))"
+        then # panel is in this monitor
+             if test "$px" -ge "$(( x + ( w / 2)))"
+             then # x in right half, must be a right panel so make sure area doesn't go x2 past left edge of this panel
+                  let x2="x2>px?px:x2"
+             elif test "$py" -ge "$(( y + (h / 2) ))"
+             then # y in bottom half, must be a bottom panel, so make sure area doesn't go y2 past top edge of this panel
+                  let y2="y2>py?py:y2"
+             elif test "$pw" -le "$(( w / 2))"
+             then : # right side in left half, must be a left panel, so make sure area doesn't x1 before px+pw
+                  let x1="x1<(px+pw)?(px+pw)?x1"
+             elif test "$ph" -le "$(( h / 2))"
+             then : # bottom side top half, must be a top panel, so make sure area doesn't y1 before py_ph
+                  let y1="y1<(py+ph)?(py+ph)?y1"
+             else : # dunno!
+             fi
+        fi
+     done
+
+     areas+=" $x1,$y1,$((x2-x1)),$((y2-y1))"
+     let x+="$w"
+  done
+
+  echo "$areas"
+}
+
+add-areas() {
+  eval $(xprop -root | xprop-to-bash-hash ; test "${PIPE_STATUS[0]}" = "0 0")
+  local desktops desktop areas x y w h
+
+  # read screen areas from desktop
+  desktop="${xprop[_NET_CURRENT_DESKTOP]}"
+
+  # Try to use gtk work areas
+  areas="${xprop[_GTK_WORKAREAS_D$desktop]}"
+
+  if test -z "$areas"
+  then case "$DESKTOP_SESSION" in
+       mate) compute-mate-areas;;
+       cinnamon) compute-cinnamon-areas;;
+       esac
+  fi
+  # test -z "$areas" && areas="0,0,5140,1440 5140,0,7160,1200"
+
+  if test -n "$areas"
+  then while test -n "$areas" && IFS="$IFS," read -r x y w h areas <<<"$areas"
+       do add-area $x $y $w $h
+       done
+  fi
+}
+
+declare -a positions
+add-area() {
+  local div
+  local x=$1 y=$2 w=$3 h=$4
+
+  if test $w -ge 5000
+  then div=3
+  elif test $w -ge 2000
+  then div=2
+  else div=1
+  fi
+
+  local n=$div span=1
+
+  while :
+  do let n=div _x=$x _y=$y _w=$w __w=$w _h=$h
+     while test "$n" -ge $span
+     do let _w="__w * span / n"
+        positions+=("$_x,$_y,$_w,$_h")
+        let _x="_x + (__w / n)"
+        let __w="__w - (__w / n)"
+        let n="n-1"
+     done
+
+     test $span = $div && break
+     let span++
+  done
+}
+
+set-win-pos-size-ws() {
+  local id="$1" ; shift
+
+  if type -P wmctrl &>/dev/null
+  then wmctrl -ir "$id" -b remove,fullscreen
+       wmctrl -ir "$id" -b remove,maximized_vert,maximized_horz
+       wmctrl -ir "$id" ${5+ -t "$5"} -e "0,$1,$2,$3,$4"
+  fi
+}
+
+main() {
+  local pos="$1" ; shift
+  local id
+
+  add-areas
+  id="${xprop[_NET_ACTIVE_WINDOW]}"
+  test -n "$id" || id=$(xdotool getactivewindow)
+  test -n "$id" || return 1
+
+  local x y w h
+  IFS="," read -r x y w h _ <<<"${positions[$pos]}" || return 1
+
+  # make not-maximized
+
+  set-win-pos-size-ws $id $x $y $w $h
+}
+
+
+main "$@"
